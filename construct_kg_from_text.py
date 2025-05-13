@@ -40,6 +40,9 @@ VECTOR_NODE_LABEL = 'Chunk'
 VECTOR_SOURCE_PROPERTY = 'text'
 VECTOR_EMBEDDING_PROPERTY = 'textEmbedding'
 
+kg = Neo4jGraph(
+    url=NEO4J_URI, username=NEO4J_USERNAME, password=NEO4J_PASSWORD, database=NEO4J_DATABASE
+)
 
 
 # Neo4j connection management
@@ -428,6 +431,46 @@ def create_form10k_node():
         # Create the Form node
         # create_form(form_info)
         create_form(form_info)
+
+        cypher = """
+  MATCH (from_same_section:Chunk)
+  WHERE from_same_section.formId = $formIdParam
+    AND from_same_section.f10kItem = $f10kItemParam
+  WITH from_same_section
+    ORDER BY from_same_section.chunkSeqId ASC
+  WITH collect(from_same_section) as section_chunk_list
+    CALL apoc.nodes.link(
+        section_chunk_list, 
+        "NEXT", 
+        {avoidDuplicates: true}
+    )
+  RETURN size(section_chunk_list)
+"""
+        for form10kItemName in ['item1', 'item1a', 'item7', 'item7a']:
+            kg.query(cypher, params={'formIdParam':form_info['formId'], 
+                           'f10kItemParam': form10kItemName})
+
+        cypher = """
+    MATCH (c:Chunk), (f:Form)
+    WHERE c.formId = f.formId
+    MERGE (c)-[newRelationship:PART_OF]->(f)
+    RETURN count(newRelationship)
+    """
+
+        match = kg.query(cypher)
+        print(f"Created PART_OF relationship between Form and Chunk nodes: {match}")
+        cypher = """
+  MATCH (first:Chunk), (f:Form)
+  WHERE first.formId = f.formId
+    AND first.chunkSeqId = 0
+  WITH first, f
+    MERGE (f)-[r:SECTION {f10kItem: first.f10kItem}]->(first)
+  RETURN count(r)
+"""
+
+        print(kg.query(cypher))
+      
+    
     else:
         print("No Form 10-K node found")
     driver.close()
@@ -437,20 +480,20 @@ def create_form10k_node():
 # Main execution flow
 if __name__ == "__main__":
     # Initial file processing
-    first_file_name = "./data/form10k/0000950170-23-027948.json"
-    first_file_chunks = split_form10k_data_from_file(first_file_name)
-    print(f'First file has {len(first_file_chunks)} chunks')
+    # first_file_name = "./data/form10k/0000950170-23-027948.json"
+    # first_file_chunks = split_form10k_data_from_file(first_file_name)
+    # print(f'First file has {len(first_file_chunks)} chunks')
     
-    # Set up Neo4j database
-    setup_neo4j_constraints_and_indexes()
+    # # Set up Neo4j database
+    # setup_neo4j_constraints_and_indexes()
     
-    # Load chunks to Neo4j
-    print("Loading chunks to Neo4j with embeddings...")
-    chunks_loaded = load_chunks_to_neo4j(first_file_chunks)
-    print(f"Completed loading {chunks_loaded} chunks")
+    # # Load chunks to Neo4j
+    # print("Loading chunks to Neo4j with embeddings...")
+    # chunks_loaded = load_chunks_to_neo4j(first_file_chunks)
+    # print(f"Completed loading {chunks_loaded} chunks")
     
-    # Check database statistics
-    check_chunk_statistics()
+    # # Check database statistics
+    # check_chunk_statistics()
     create_form10k_node()
     
     # # Example vector search
