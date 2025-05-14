@@ -33,6 +33,7 @@ warnings.filterwarnings("ignore")
 
 # In[ ]:
 
+GEMINI_ENDPOINT='https://generativelanguage.googleapis.com/v1beta/models/embedding-001:embedContent'
 
 def load_env_and_constants():
     load_dotenv('.env', override=True)
@@ -41,18 +42,29 @@ def load_env_and_constants():
     NEO4J_PASSWORD = os.getenv('NEO4J_PASSWORD')
     NEO4J_DATABASE = os.getenv('NEO4J_DATABASE') or 'neo4j'
     GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-    GEMINI_ENDPOINT = os.getenv('GEMINI_BASE_URL') + '/v1beta/models/embedding-001:embedContent'
     VECTOR_INDEX_NAME = 'form_10k_chunks'
     VECTOR_NODE_LABEL = 'Chunk'
     VECTOR_SOURCE_PROPERTY = 'text'
     VECTOR_EMBEDDING_PROPERTY = 'textEmbedding'
+    # Add validation for required Neo4j credentials
+    missing = []
+    if not NEO4J_URI:
+        missing.append("NEO4J_URI")
+    if not NEO4J_USERNAME:
+        missing.append("NEO4J_USERNAME")
+    if not NEO4J_PASSWORD:
+        missing.append("NEO4J_PASSWORD")
+    if missing:
+        raise ValueError(
+            f"Missing required Neo4j environment variables: {', '.join(missing)}. "
+            "Please check your .env file."
+        )
     return {
         "NEO4J_URI": NEO4J_URI,
         "NEO4J_USERNAME": NEO4J_USERNAME,
         "NEO4J_PASSWORD": NEO4J_PASSWORD,
         "NEO4J_DATABASE": NEO4J_DATABASE,
         "GEMINI_API_KEY": GEMINI_API_KEY,
-        "GEMINI_ENDPOINT": GEMINI_ENDPOINT,
         "VECTOR_INDEX_NAME": VECTOR_INDEX_NAME,
         "VECTOR_NODE_LABEL": VECTOR_NODE_LABEL,
         "VECTOR_SOURCE_PROPERTY": VECTOR_SOURCE_PROPERTY,
@@ -123,121 +135,83 @@ def create_vector_index(kg):
         CREATE VECTOR INDEX `form_10k_chunks` IF NOT EXISTS
         FOR (c:Chunk) ON (c.textEmbedding) 
         OPTIONS { indexConfig: {
-            `vector.dimensions`: 1536,
+            `vector.dimensions`: 768,
             `vector.similarity_function`: 'cosine'    
         }}
     """)
 
 def populate_embeddings(kg, gemini_api_key, gemini_endpoint):
-    kg.query("""
-        MATCH (chunk:Chunk) WHERE chunk.textEmbedding IS NULL
-        WITH chunk, genai.vector.encode(
-            chunk.text, 
-            "Gemini", 
-            {
-                token: $geminiApiKey, 
-                endpoint: $geminiEndpoint
-            }) AS vector
-        CALL db.create.setNodeVectorProperty(chunk, "textEmbedding", vector)
-        """, 
-        params={"geminiApiKey": gemini_api_key, "geminiEndpoint": gemini_endpoint} )
+    # 1. Get all Chunk nodes without embeddings
+    chunks = kg.query("""
+        MATCH (chunk:Chunk)
+        WHERE chunk.textEmbedding IS NULL
+        RETURN chunk.chunkId AS chunkId, chunk.text AS text
+    """)
+    if not chunks:
+        print("No chunks found that need embeddings.")
+        return
 
-def neo4j_vector_search(kg, question, gemini_api_key, gemini_endpoint, vector_index_name, top_k=10):
-    vector_search_query = """
-        WITH genai.vector.encode(
-            $question, 
-            "Gemini", 
-            {
-                token: $geminiApiKey,
-                endpoint: $geminiEndpoint
-            }) AS question_embedding
-        CALL db.index.vector.queryNodes($index_name, $top_k, question_embedding) yield node, score
-        RETURN score, node.text AS text
-    """
-    similar = kg.query(vector_search_query, 
-        params={
-            'question': question, 
-            'geminiApiKey': gemini_api_key,
-            'geminiEndpoint': gemini_endpoint,
-            'index_name': vector_index_name, 
-            'top_k': top_k})
-    return similar
-
-def get_neo4j_vector_store(cfg):
-    return Neo4jVector.from_existing_graph(
-        embedding=GoogleGenerativeAIEmbeddings(google_api_key=cfg["GEMINI_API_KEY"]),
-        url=cfg["NEO4J_URI"],
-        username=cfg["NEO4J_USERNAME"],
-        password=cfg["NEO4J_PASSWORD"],
-        index_name=cfg["VECTOR_INDEX_NAME"],
-        node_label=cfg["VECTOR_NODE_LABEL"],
-        text_node_properties=[cfg["VECTOR_SOURCE_PROPERTY"]],
-        embedding_node_property=cfg["VECTOR_EMBEDDING_PROPERTY"],
+    # 2. Set up the embedding model
+    embedder = GoogleGenerativeAIEmbeddings(
+        model="models/embedding-001",
+        google_api_key=gemini_api_key
     )
 
-def get_chain(retriever):
-    return RetrievalQAWithSourcesChain.from_chain_type(
-        ChatGoogleGenerativeAI(google_api_key=os.getenv('GEMINI_API_KEY'), temperature=0), 
-        chain_type="stuff", 
-        retriever=retriever
-    )
+    # 3. For each chunk, generate embedding and update node
+    for chunk in chunks:
+        chunk_id = chunk["chunkId"]
+        text = chunk["text"]
+        try:
+            embedding = embedder.embed_query(text)
+            # Update the node with the embedding
+            kg.query(
+                """
+                MATCH (c:Chunk {chunkId: $chunkId})
+                SET c.textEmbedding = $embedding
+                """,
+                params={"chunkId": chunk_id, "embedding": embedding}
+            )
+            print(f"Set embedding for chunk {chunk_id}")
+        except Exception as e:
+            print(f"Failed to embed chunk {chunk_id}: {e}")
 
-def prettychain(chain, question: str) -> str:
-    response = chain({"question": question}, return_only_outputs=True)
-    print(textwrap.fill(response['answer'], 60))
+def chunks_exist_for_form(kg, form_id):
+    result = kg.query(
+        "MATCH (c:Chunk {formId: $formId}) RETURN count(c) AS count",
+        params={"formId": form_id}
+    )
+    return result[0]['count'] > 0
 
 def main():
     cfg = load_env_and_constants()
     text_splitter = get_text_splitter()
     first_file_name = "./data/form10k/0000950170-23-027948.json"
-    first_file_chunks = split_form10k_data_from_file(first_file_name, text_splitter)
-
-    merge_chunk_node_query = """
-    MERGE(mergedChunk:Chunk {chunkId: $chunkParam.chunkId})
-        ON CREATE SET 
-            mergedChunk.names = $chunkParam.names,
-            mergedChunk.formId = $chunkParam.formId, 
-            mergedChunk.cik = $chunkParam.cik, 
-            mergedChunk.cusip6 = $chunkParam.cusip6, 
-            mergedChunk.source = $chunkParam.source, 
-            mergedChunk.f10kItem = $chunkParam.f10kItem, 
-            mergedChunk.chunkSeqId = $chunkParam.chunkSeqId, 
-            mergedChunk.text = $chunkParam.text
-    RETURN mergedChunk
-    """
-
+    # Extract form_id from filename (same logic as in split_form10k_data_from_file)
+    form_id = first_file_name[first_file_name.rindex('/') + 1:first_file_name.rindex('.')]
     kg = create_kg_connection(cfg)
     create_uniqueness_constraint(kg)
-    create_chunk_nodes(kg, first_file_chunks, merge_chunk_node_query)
-    create_vector_index(kg)
-    populate_embeddings(kg, cfg["GEMINI_API_KEY"], cfg["GEMINI_ENDPOINT"])
+    if chunks_exist_for_form(kg, form_id):
+        print(f"Chunks for formId '{form_id}' already exist. Skipping chunk creation and embedding population.")
+    else:
+        first_file_chunks = split_form10k_data_from_file(first_file_name, text_splitter)
+        merge_chunk_node_query = """
+        MERGE(mergedChunk:Chunk {chunkId: $chunkParam.chunkId})
+            ON CREATE SET 
+                mergedChunk.names = $chunkParam.names,
+                mergedChunk.formId = $chunkParam.formId, 
+                mergedChunk.cik = $chunkParam.cik, 
+                mergedChunk.cusip6 = $chunkParam.cusip6, 
+                mergedChunk.source = $chunkParam.source, 
+                mergedChunk.f10kItem = $chunkParam.f10kItem, 
+                mergedChunk.chunkSeqId = $chunkParam.chunkSeqId, 
+                mergedChunk.text = $chunkParam.text
+        RETURN mergedChunk
+        """
+        create_chunk_nodes(kg, first_file_chunks, merge_chunk_node_query)
+        create_vector_index(kg)
+        populate_embeddings(kg, cfg["GEMINI_API_KEY"], GEMINI_ENDPOINT)
     kg.refresh_schema()
     print(kg.schema)
-
-    # Example vector search
-    search_results = neo4j_vector_search(
-        kg,
-        'In a single sentence, tell me about Netapp.',
-        cfg["GEMINI_API_KEY"],
-        cfg["GEMINI_ENDPOINT"],
-        cfg["VECTOR_INDEX_NAME"]
-    )
-    print(search_results[0])
-
-    # LangChain RAG workflow
-    neo4j_vector_store = get_neo4j_vector_store(cfg)
-    retriever = neo4j_vector_store.as_retriever()
-    chain = get_chain(retriever)
-
-    # Example questions
-    prettychain(chain, "What is Netapp's primary business?")
-    prettychain(chain, "Where is Netapp headquartered?")
-    prettychain(chain, "Tell me about Netapp. Limit your answer to a single sentence.")
-    prettychain(chain, "Tell me about Apple. Limit your answer to a single sentence.")
-    prettychain(chain, "Tell me about Apple. Limit your answer to a single sentence. If you are unsure about the answer, say you don't know.")
-
-    # Add your own question here
-    prettychain(chain, "ADD YOUR OWN QUESTION HERE")
 
 if __name__ == "__main__":
     main()
